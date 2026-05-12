@@ -1,142 +1,125 @@
 """
 Input Guardrail
-Checks user inputs for safety violations.
+Detects unsafe user inputs across three policy categories:
+1. Harmful content (violence, illegal activity, self-harm)
+2. Prompt injection attempts (role override, system prompt leak attempts)
+3. Off-topic queries (outside the configured HCI research scope)
 """
 
 from typing import Dict, Any, List
+import re
 
 
 class InputGuardrail:
-    """
-    Guardrail for checking input safety.
+    """Input safety validator with keyword + regex policy checks."""
 
-    TODO: YOUR CODE HERE
-    - Integrate with Guardrails AI or NeMo Guardrails
-    - Define validation rules
-    - Implement custom validators
-    - Handle different types of violations
-    """
+    # --- Policy 1: Harmful content keywords ---
+    HARMFUL_KEYWORDS = [
+        "make a bomb", "build a bomb", "how to kill", "how to murder",
+        "self harm", "self-harm", "kill myself", "suicide method",
+        "child sexual", "csam", "child porn",
+        "synthesize methamphetamine", "cook meth",
+        "buy fentanyl", "obtain ricin", "weaponize anthrax",
+    ]
+
+    # --- Policy 2: Prompt injection patterns ---
+    INJECTION_PATTERNS = [
+        r"ignore (?:all |the )?(?:previous|above|prior) (?:instructions|prompts?|rules?)",
+        r"disregard (?:all |the )?(?:previous|above|prior) (?:instructions|prompts?|rules?)",
+        r"forget (?:everything|all instructions|your instructions)",
+        r"you are now (?:a |an )?(?:different|new|jailbroken)",
+        r"system\s*:",
+        r"reveal (?:your |the )?(?:system )?prompt",
+        r"print (?:your |the )?(?:system )?prompt",
+        r"<\|im_start\|>",
+        r"###\s*instruction",
+        r"act as (?:a |an )?(?:dan|developer mode|unrestricted)",
+    ]
+
+    # --- Policy 3: On-topic HCI keywords (require at least one to be on-topic) ---
+    HCI_KEYWORDS = [
+        "hci", "human-computer", "human computer", "ui", "ux", "user interface",
+        "user experience", "usability", "accessibility", "interaction design",
+        "explainable", "xai", "interpretab", "explanation", "interpret",
+        "ai", "artificial intelligence", "machine learning", "ml", "llm",
+        "design", "user", "interface", "novice", "expert", "cognitive",
+        "research", "study", "evaluation", "prototype", "agent", "chatbot",
+        "ar", "vr", "mixed reality", "augmented", "virtual", "wearable",
+        "ethics", "trust", "transparency", "fairness", "bias", "education",
+    ]
 
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize input guardrail.
-
-        Args:
-            config: Configuration dictionary
-        """
-        self.config = config
-
-        # TODO: Initialize guardrail framework
-        # Suggested implementation:
-        # - Read safety settings from config.yaml
-        # - Store min/max query length thresholds
-        # - Prepare policy categories such as harmful content,
-        #   prompt injection, and off-topic queries
-        # - Optionally initialize Guardrails AI / NeMo Guardrails here
+        self.config = config or {}
+        safety_cfg = self.config.get("safety", self.config)
+        self.min_length = safety_cfg.get("min_query_length", 5)
+        self.max_length = safety_cfg.get("max_query_length", 2000)
+        self.check_relevance = safety_cfg.get("check_relevance", True)
 
     def validate(self, query: str) -> Dict[str, Any]:
-        """
-        Validate input query.
+        """Run all input checks and return a structured result."""
+        violations: List[Dict[str, Any]] = []
+        text = (query or "").strip()
+        lower = text.lower()
 
-        Args:
-            query: User input to validate
-
-        Returns:
-            Validation result
-
-        TODO: YOUR CODE HERE
-        - Implement validation logic
-        - Check for toxic language
-        - Check for prompt injection attempts
-        - Check query length and format
-        - Check for off-topic queries
-        """
-        violations = []
-
-        # TODO: Implement actual validation
-        # Suggested implementation:
-        # 1. Normalize the input (strip spaces, lowercase copy for keyword checks)
-        # 2. Add length checks using thresholds from config
-        # 3. Call helper methods like _check_toxic_language(),
-        #    _check_prompt_injection(), and _check_relevance()
-        # 4. Decide whether violations should block, sanitize, or warn
-        # 5. Return both the raw violations and a sanitized_input if applicable
-
-        # Placeholder checks
-        if len(query) < 5:
+        # Length checks
+        if len(text) < self.min_length:
             violations.append({
-                "validator": "length",
-                "reason": "Query too short",
-                "severity": "low"
+                "validator": "length", "category": "format",
+                "reason": "Query too short (min %d chars)" % self.min_length,
+                "severity": "low",
+            })
+        if len(text) > self.max_length:
+            violations.append({
+                "validator": "length", "category": "format",
+                "reason": "Query too long (max %d chars)" % self.max_length,
+                "severity": "medium",
             })
 
-        if len(query) > 2000:
-            violations.append({
-                "validator": "length",
-                "reason": "Query too long",
-                "severity": "medium"
-            })
+        # Policy checks
+        violations.extend(self._check_harmful_content(lower))
+        violations.extend(self._check_prompt_injection(lower))
+        if self.check_relevance:
+            violations.extend(self._check_relevance(lower))
 
         return {
             "valid": len(violations) == 0,
             "violations": violations,
-            "sanitized_input": query  # Could be modified version
+            "sanitized_input": text,
         }
 
-    def _check_toxic_language(self, text: str) -> List[Dict[str, Any]]:
-        """
-        Check for toxic/harmful language.
-
-        TODO: YOUR CODE HERE
-        Suggested implementation:
-        - Use a moderation API, Guardrails validator, or keyword/rule-based classifier
-        - Return a list of violations with validator name, reason, and severity
-        - Mark clearly unsafe requests as high severity
-        """
+    def _check_harmful_content(self, text: str) -> List[Dict[str, Any]]:
         violations = []
-        # Implement toxicity check
+        for kw in self.HARMFUL_KEYWORDS:
+            if kw in text:
+                violations.append({
+                    "validator": "harmful_content",
+                    "category": "harmful_content",
+                    "reason": f"Matched harmful keyword: '{kw}'",
+                    "severity": "high",
+                })
         return violations
 
     def _check_prompt_injection(self, text: str) -> List[Dict[str, Any]]:
-        """
-        Check for prompt injection attempts.
-
-        TODO: YOUR CODE HERE
-        Suggested implementation:
-        - Detect phrases like \"ignore previous instructions\",
-        #   attempts to reveal system prompts, or role-confusion attacks
-        - Consider whether the result should block the request or sanitize it
-        """
         violations = []
-        # Check for common prompt injection patterns
-        injection_patterns = [
-            "ignore previous instructions",
-            "disregard",
-            "forget everything",
-            "system:",
-            "sudo",
-        ]
-
-        for pattern in injection_patterns:
-            if pattern.lower() in text.lower():
+        for pattern in self.INJECTION_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
                 violations.append({
                     "validator": "prompt_injection",
-                    "reason": f"Potential prompt injection: {pattern}",
-                    "severity": "high"
+                    "category": "prompt_injection",
+                    "reason": f"Matched injection pattern: '{pattern}'",
+                    "severity": "high",
                 })
-
         return violations
 
-    def _check_relevance(self, query: str) -> List[Dict[str, Any]]:
-        """
-        Check if query is relevant to the system's purpose.
-
-        TODO: YOUR CODE HERE
-        Suggested implementation:
-        - Compare the query to the configured topic in config.yaml
-        - Use keyword heuristics or an LLM classifier
-        - Return low/medium severity violations for off-topic requests
-        """
-        violations = []
-        # Check if query is about HCI research (or configured topic)
-        return violations
+    def _check_relevance(self, text: str) -> List[Dict[str, Any]]:
+        """Off-topic if NO HCI-related keyword is present."""
+        if any(kw in text for kw in self.HCI_KEYWORDS):
+            return []
+        if len(text.split()) < 3:
+            return []  # too short to judge, length check already handles
+        return [{
+            "validator": "relevance",
+            "category": "off_topic_queries",
+            "reason": "Query appears off-topic (no HCI/AI terms detected)",
+            "severity": "low",
+        }]

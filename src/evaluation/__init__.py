@@ -1,12 +1,5 @@
-"""
-Evaluation Module
-LLM-as-a-Judge implementation for evaluating system outputs.
-"""
-
-from .judge import LLMJudge
+"""Evaluation package."""
+from .judge import Judge
 from .evaluator import SystemEvaluator
 
-__all__ = [
-    "LLMJudge",
-    "SystemEvaluator",
-]
+__all__ = ["Judge", "SystemEvaluator"]

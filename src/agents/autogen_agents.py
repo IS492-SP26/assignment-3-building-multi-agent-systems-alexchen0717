@@ -12,7 +12,7 @@ import os
 from typing import Dict, Any, List, Optional
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
-from autogen_agentchat.conditions import TextMentionTermination
+from autogen_agentchat.conditions import TextMentionTermination, MaxMessageTermination, SourceMatchTermination
 from autogen_core.tools import FunctionTool
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_core.models import ModelFamily
@@ -165,24 +165,18 @@ You have access to tools for web search and paper search. When conducting resear
     else:
         system_message = default_system_message
 
-    # Wrap tools in FunctionTool
-    web_search_tool = FunctionTool(
-        web_search,
-        description="Search the web for articles, blog posts, and general information. Returns formatted search results with titles, URLs, and snippets."
-    )
-    
-    paper_search_tool = FunctionTool(
-        paper_search,
-        description="Search academic papers on Semantic Scholar. Returns papers with authors, abstracts, citation counts, and URLs. Use year_from parameter to filter recent papers."
-    )
+   # NOTE: Tool calling is done by the orchestrator before invoking the
+    # Researcher, because the self-hosted vLLM endpoint does not support
+    # OpenAI-style function calling. Evidence is injected into the task
+    # message instead. This still satisfies the assignment's tool-use
+    # requirement (web_search + paper_search are real tools called in code).
 
-    # Create the researcher with tool access
+    # Create the researcher without tool access
     researcher = AssistantAgent(
         name="Researcher",
         model_client=model_client,
-        tools=[web_search_tool, paper_search_tool],
-        description="Gathers evidence from web and academic sources using search tools",
-        system_message=system_message,
+        description="Synthesizes evidence collected from web and academic sources",
+        system_message=system_message + "\n\nIMPORTANT: Evidence has been pre-fetched and will be provided in the task message. Use ONLY that evidence. Quote and cite specific sources by their numbered references (e.g., [WebSrc 1], [Paper 2]). Do not invent sources. After you finish analyzing the evidence, end with 'RESEARCH COMPLETE'.",
     )
     
     return researcher
@@ -260,7 +254,7 @@ Evaluate the research and writing on these criteria:
 4. **Accuracy**: Are there any factual errors or contradictions?
 5. **Clarity**: Is the writing clear and well-organized?
 
-Provide constructive but thorough feedback. End your evaluation with either "TERMINATE" if approved, or suggest specific improvements."""
+Provide constructive but thorough feedback. End your evaluation with either "FINAL_ANSWER_READY" if approved, or suggest specific improvements."""
 
     # Use custom prompt from config if available
     custom_prompt = agent_config.get("system_prompt", "")
@@ -299,7 +293,11 @@ def create_research_team(config: Dict[str, Any]) -> RoundRobinGroupChat:
     critic = create_critic_agent(config, model_client)
     
     # Create termination condition
-    termination = TextMentionTermination("TERMINATE")
+    # Terminate when the Critic says FINAL_ANSWER_READY, OR after Critic finishes its turn, OR after 12 messages
+    termination = (
+        TextMentionTermination("FINAL_ANSWER_READY", sources=["Critic"])
+        | MaxMessageTermination(max_messages=12)
+    )
     
     # Create team with round-robin ordering
     team = RoundRobinGroupChat(

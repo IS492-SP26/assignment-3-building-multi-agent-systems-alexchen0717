@@ -1,299 +1,236 @@
 """
-AutoGen-Based Orchestrator
+AutoGen-Based Orchestrator.
 
-This orchestrator uses AutoGen's RoundRobinGroupChat to coordinate multiple agents
-in a research workflow.
-
-Workflow:
-1. Planner: Breaks down the query into research steps
-2. Researcher: Gathers evidence using web and paper search tools
-3. Writer: Synthesizes findings into a coherent response
-4. Critic: Evaluates quality and provides feedback
+Pre-fetches evidence using the async tool APIs (avoiding asyncio.run() nesting),
+then injects the evidence into the RoundRobinGroupChat task message.
 """
 
 import logging
 import asyncio
-from typing import Dict, Any, List, Optional
+import os
+import re
+from typing import Dict, Any, List
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from src.agents.autogen_agents import create_research_team
+from src.tools.web_search import WebSearchTool
+from src.tools.paper_search import PaperSearchTool
 
 
 class AutoGenOrchestrator:
-    """
-    Orchestrates multi-agent research using AutoGen's RoundRobinGroupChat.
-    
-    This orchestrator manages a team of specialized agents that work together
-    to answer research queries. It uses AutoGen's built-in conversation
-    management and tool execution capabilities.
-    """
+    """Coordinates the multi-agent research workflow."""
 
     def __init__(self, config: Dict[str, Any]):
-        """
-        Initialize the AutoGen orchestrator.
-
-        Args:
-            config: Configuration dictionary from config.yaml
-        """
         self.config = config
         self.logger = logging.getLogger("autogen_orchestrator")
-        
-        # Create the research team
         self.logger.info("Creating research team...")
         self.team = create_research_team(config)
-        
         self.logger.info("Research team created successfully")
-        
-        # Workflow trace for debugging and UI display
-        self.workflow_trace: List[Dict[str, Any]] = []
 
     def process_query(self, query: str, max_rounds: int = 20) -> Dict[str, Any]:
-        """
-        Process a research query through the multi-agent system.
-
-        Args:
-            query: The research question to answer
-            max_rounds: Maximum number of conversation rounds
-
-        Returns:
-            Dictionary containing:
-            - query: Original query
-            - response: Final synthesized response
-            - conversation_history: Full conversation between agents
-            - metadata: Additional information about the process
-        """
         self.logger.info(f"Processing query: {query}")
-        
         try:
-            # Run the async query processing
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an async context, create a new loop
+            try:
+                asyncio.get_running_loop()
                 import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    result = pool.submit(
-                        asyncio.run, 
-                        self._process_query_async(query, max_rounds)
-                    ).result()
-            else:
-                result = loop.run_until_complete(self._process_query_async(query, max_rounds))
-            
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(asyncio.run, self._process_query_async(query, max_rounds))
+                    result = future.result()
+            except RuntimeError:
+                result = asyncio.run(self._process_query_async(query, max_rounds))
             self.logger.info("Query processing complete")
             return result
-            
         except Exception as e:
             self.logger.error(f"Error processing query: {e}", exc_info=True)
             return {
                 "query": query,
                 "error": str(e),
-                "response": f"An error occurred while processing your query: {str(e)}",
+                "response": f"An error occurred: {str(e)}",
                 "conversation_history": [],
-                "metadata": {"error": True}
+                "metadata": {"error": True},
             }
-    
+
     async def _process_query_async(self, query: str, max_rounds: int = 20) -> Dict[str, Any]:
-        """
-        Async implementation of query processing.
-        
-        Args:
-            query: The research question to answer
-            max_rounds: Maximum number of conversation rounds
-            
-        Returns:
-            Dictionary containing results
-        """
-        # Create task message
-        task_message = f"""Research Query: {query}
+        self.logger.info(f"TAVILY_API_KEY present: {bool(os.getenv('TAVILY_API_KEY'))}")
 
-Please work together to answer this query comprehensively:
-1. Planner: Create a research plan
-2. Researcher: Gather evidence from web and academic sources
-3. Writer: Synthesize findings into a well-cited response
-4. Critic: Evaluate the quality and provide feedback"""
-        
-        # Run the team
+        # ---- Pre-fetch evidence using ASYNC tool APIs (no asyncio.run nesting) ----
+        web_tool = WebSearchTool(provider="tavily", max_results=5)
+        paper_tool = PaperSearchTool(max_results=5)
+
+        self.logger.info("Pre-fetching web search results...")
+        try:
+            web_results_list = await web_tool.search(query)
+            web_results = self._format_web_results(query, web_results_list)
+        except Exception as e:
+            self.logger.error(f"Web search failed: {e}", exc_info=True)
+            web_results = "No web results available."
+            web_results_list = []
+
+        self.logger.info("Pre-fetching academic papers...")
+        try:
+            paper_results_list = await paper_tool.search(query)
+            paper_results = self._format_paper_results(query, paper_results_list)
+        except Exception as e:
+            self.logger.error(f"Paper search failed: {e}", exc_info=True)
+            paper_results = "No academic papers available."
+            paper_results_list = []
+
+        self.logger.info(f"Got {len(web_results_list)} web results, {len(paper_results_list)} papers")
+
+        # Truncate to keep prompt manageable for 8B model
+        web_trunc = web_results[:3500]
+        paper_trunc = paper_results[:3500]
+
+        # ---- Task message - DO NOT include the termination string ----
+        # The termination condition is now Critic-only-sourced, so even if "FINAL_ANSWER_READY"
+        # were in the task it wouldn't trip - but we keep it out anyway as defense in depth.
+        task_message = (
+            f"Research Query: {query}\n\n"
+            "Evidence has been gathered. Use ONLY this evidence; do not invent sources.\n\n"
+            "=== WEB SEARCH EVIDENCE ===\n"
+            f"{web_trunc}\n\n"
+            "=== ACADEMIC PAPER EVIDENCE ===\n"
+            f"{paper_trunc}\n\n"
+            "=== WORKFLOW INSTRUCTIONS ===\n"
+            "- Planner: produce a short plan (2-3 sub-questions). End with: PLAN COMPLETE.\n"
+            "- Researcher: analyze the evidence, extract key findings, cite as [WebSrc N] or [Paper N]. End with: RESEARCH COMPLETE.\n"
+            "- Writer: synthesize a clear response with inline citations and a References section. End with: DRAFT COMPLETE.\n"
+            "- Critic: evaluate the response. If acceptable, end your message with the approval phrase the system expects. Otherwise list specific improvements and say NEEDS REVISION."
+        )
+
+        # ---- Run the team ----
         result = await self.team.run(task=task_message)
-        
-        # Extract conversation history
+
+        # ---- Extract conversation history ----
         messages = []
-        async for message in result.messages:
-            msg_dict = {
-                "source": message.source,
-                "content": message.content if hasattr(message, 'content') else str(message),
-            }
-            messages.append(msg_dict)
-        
-        # Extract final response
-        final_response = ""
-        if messages:
-            # Get the last message from Writer or Critic
-            for msg in reversed(messages):
-                if msg.get("source") in ["Writer", "Critic"]:
-                    final_response = msg.get("content", "")
-                    break
-        
-        # If no response found, use the last message
-        if not final_response and messages:
-            final_response = messages[-1].get("content", "")
-        
-        return self._extract_results(query, messages, final_response)
+        for message in result.messages:
+            messages.append({
+                "source": getattr(message, "source", "unknown"),
+                "content": message.content if hasattr(message, "content") else str(message),
+            })
 
-    def _extract_results(self, query: str, messages: List[Dict[str, Any]], final_response: str = "") -> Dict[str, Any]:
-        """
-        Extract structured results from the conversation history.
+        # ---- Pick final response: best Writer draft ----
+        # Prefer the longest Writer message (real synthesis, not a rubber-stamp)
+        writer_msgs = [m.get("content", "") for m in messages if m.get("source") == "Writer"]
+        writer_msgs = [c for c in writer_msgs if c and len(c.strip()) > 100]
+        if writer_msgs:
+            # Longest writer message tends to be the actual draft
+            final_response = max(writer_msgs, key=len)
+        else:
+            # Fallback: any reasonably long non-user message
+            non_user = [m.get("content", "") for m in messages if m.get("source") not in ("user", "unknown")]
+            non_user = [c for c in non_user if c and len(c.strip()) > 100]
+            final_response = max(non_user, key=len) if non_user else (messages[-1].get("content", "") if messages else "")
 
-        Args:
-            query: Original query
-            messages: List of conversation messages
-            final_response: Final response from the team
+        # Build sources list from what we actually fetched
+        sources = []
+        for i, r in enumerate(web_results_list, 1):
+            sources.append({
+                "ref": f"WebSrc {i}",
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "type": "webpage",
+            })
+        for i, p in enumerate(paper_results_list, 1):
+            sources.append({
+                "ref": f"Paper {i}",
+                "title": p.get("title", ""),
+                "url": p.get("url", ""),
+                "authors": p.get("authors", []),
+                "year": p.get("year"),
+                "venue": p.get("venue", ""),
+                "type": "paper",
+            })
 
-        Returns:
-            Structured result dictionary
-        """
-        # Extract components from conversation
-        research_findings = []
+        return self._extract_results(query, messages, final_response, sources)
+
+    def _format_web_results(self, query, results):
+        if not results:
+            return "No search results found."
+        out = f"Found {len(results)} web search results for '{query}':\n\n"
+        for i, r in enumerate(results, 1):
+            out += f"[WebSrc {i}] {r.get('title', '')}\n"
+            out += f"   URL: {r.get('url', '')}\n"
+            snippet = (r.get('snippet') or '')[:400]
+            out += f"   {snippet}\n\n"
+        return out
+
+    def _format_paper_results(self, query, results):
+        if not results:
+            return "No academic papers found."
+        src = results[0].get("source", "unknown")
+        out = f"Found {len(results)} academic papers for '{query}' (source: {src}):\n\n"
+        for i, p in enumerate(results, 1):
+            authors = ", ".join([a.get("name", "") for a in p.get("authors", [])[:3]])
+            if len(p.get("authors", [])) > 3:
+                authors += " et al."
+            out += f"[Paper {i}] {p.get('title', '')}\n"
+            out += f"   Authors: {authors}\n"
+            out += f"   Year: {p.get('year')} | Venue: {p.get('venue', 'n/a')}\n"
+            abstract = (p.get('abstract') or '')[:300]
+            if abstract:
+                out += f"   Abstract: {abstract}\n"
+            out += f"   URL: {p.get('url', '')}\n\n"
+        return out
+
+    def _extract_results(self, query, messages, final_response, sources):
         plan = ""
+        research_findings = []
         critique = ""
-        
         for msg in messages:
             source = msg.get("source", "")
             content = msg.get("content", "")
-            
             if source == "Planner" and not plan:
                 plan = content
-            
             elif source == "Researcher":
                 research_findings.append(content)
-            
             elif source == "Critic":
                 critique = content
-        
-        # Count sources mentioned in research
-        num_sources = 0
-        for finding in research_findings:
-            # Rough count of sources based on numbered results
-            num_sources += finding.count("\n1.") + finding.count("\n2.") + finding.count("\n3.")
-        
-        # Clean up final response
+
+        # Strip control tokens and Qwen's <think> blocks
         if final_response:
-            final_response = final_response.replace("TERMINATE", "").strip()
-        
+            for tok in ("FINAL_ANSWER_READY", "DRAFT COMPLETE", "TERMINATE"):
+                final_response = final_response.replace(tok, "").strip()
+            final_response = re.sub(r"<think>.*?</think>", "", final_response, flags=re.DOTALL).strip()
+
         return {
             "query": query,
             "response": final_response,
             "conversation_history": messages,
+            "sources": sources,
             "metadata": {
                 "num_messages": len(messages),
-                "num_sources": max(num_sources, 1),  # At least 1
+                "num_sources": len(sources),
                 "plan": plan,
                 "research_findings": research_findings,
                 "critique": critique,
-                "agents_involved": list(set([msg.get("source", "") for msg in messages])),
-            }
+                "agents_involved": list({m.get("source", "") for m in messages}),
+            },
         }
 
-    def get_agent_descriptions(self) -> Dict[str, str]:
-        """
-        Get descriptions of all agents.
-
-        Returns:
-            Dictionary mapping agent names to their descriptions
-        """
+    def get_agent_descriptions(self):
         return {
             "Planner": "Breaks down research queries into actionable steps",
-            "Researcher": "Gathers evidence from web and academic sources",
+            "Researcher": "Analyzes pre-fetched evidence from web + academic sources",
             "Writer": "Synthesizes findings into coherent responses",
-            "Critic": "Evaluates quality and provides feedback",
+            "Critic": "Evaluates quality and signals when the answer is ready",
         }
 
-    def visualize_workflow(self) -> str:
-        """
-        Generate a text visualization of the workflow.
-
-        Returns:
-            String representation of the workflow
-        """
-        workflow = """
-AutoGen Research Workflow:
-
-1. User Query
-   ↓
-2. Planner
-   - Analyzes query
-   - Creates research plan
-   - Identifies key topics
-   ↓
-3. Researcher (with tools)
-   - Uses web_search() tool
-   - Uses paper_search() tool
-   - Gathers evidence
-   - Collects citations
-   ↓
-4. Writer
-   - Synthesizes findings
-   - Creates structured response
-   - Adds citations
-   ↓
-5. Critic
-   - Evaluates quality
-   - Checks completeness
-   - Provides feedback
-   ↓
-6. Decision Point
-   - If APPROVED → Final Response
-   - If NEEDS REVISION → Back to Writer
-        """
-        return workflow
-
-
-def demonstrate_usage():
-    """
-    Demonstrate how to use the AutoGen orchestrator.
-    
-    This function shows a simple example of using the orchestrator.
-    """
-    import yaml
-    from dotenv import load_dotenv
-    
-    # Load environment variables
-    load_dotenv()
-    
-    # Load configuration
-    with open("config.yaml", "r") as f:
-        config = yaml.safe_load(f)
-    
-    # Create orchestrator
-    orchestrator = AutoGenOrchestrator(config)
-    
-    # Print workflow visualization
-    print(orchestrator.visualize_workflow())
-    
-    # Example query
-    query = "What are the latest trends in human-computer interaction research?"
-    
-    print(f"\nProcessing query: {query}\n")
-    print("=" * 70)
-    
-    # Process query
-    result = orchestrator.process_query(query)
-    
-    # Display results
-    print("\n" + "=" * 70)
-    print("RESULTS")
-    print("=" * 70)
-    print(f"\nQuery: {result['query']}")
-    print(f"\nResponse:\n{result['response']}")
-    print(f"\nMetadata:")
-    print(f"  - Messages exchanged: {result['metadata']['num_messages']}")
-    print(f"  - Sources gathered: {result['metadata']['num_sources']}")
-    print(f"  - Agents involved: {', '.join(result['metadata']['agents_involved'])}")
+    def visualize_workflow(self):
+        return """
+1. Query
+2. Orchestrator pre-fetches evidence (Tavily web + arXiv papers)
+3. Planner -> 4. Researcher -> 5. Writer -> 6. Critic
+7. Termination: Critic emits FINAL_ANSWER_READY (or 12-message safety cap)
+"""
 
 
 if __name__ == "__main__":
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    
-    demonstrate_usage()
-
+    import yaml
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    with open("config.yaml") as f:
+        cfg = yaml.safe_load(f)
+    o = AutoGenOrchestrator(cfg)
+    print(o.visualize_workflow())
